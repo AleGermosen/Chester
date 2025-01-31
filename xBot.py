@@ -162,7 +162,7 @@ class TwitterTranslationBot:
                         
                         # Create and post translation
                         repost_text = (
-                            f"Translated from @{self.target_username} "
+                            # f"Translated from @{self.target_username} "
                             f"({detected_language} → en):\n\n{translated_text}"
                         )
                         
@@ -201,7 +201,8 @@ def main():
         # bot = TwitterTranslationBot("haitienespanol")
         # bot = TwitterTranslationBot("DominiqueAyiti")
         # bot = TwitterTranslationBot("PresidenceHT")
-        bot = TwitterTranslationBot("metropoleHT")
+        # bot = TwitterTranslationBot("metropoleHT")
+        bot = TwitterTranslationBot("RodneyHayti")
         bot.run()
     except KeyboardInterrupt:
         logging.info("Bot stopped by user")
