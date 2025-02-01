@@ -10,7 +10,8 @@ def main():
             "DominiqueAyiti",
             "PresidenceHT",
             "metropoleHT",
-            "RodneyHayti"
+            "RodneyHayti",
+            "DIEHaiti"
         ]
         
         # Choose a username (you can modify this logic as needed)

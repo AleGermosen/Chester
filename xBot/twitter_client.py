@@ -1,8 +1,22 @@
 # twitter_client.py
+import os
 import tweepy
 import logging
 from tweet_processor import TweetProcessor
+from dotenv import load_dotenv
 
+# Load environment variables from .env file
+load_dotenv()
+
+# Get Twitter API credentials from environment variables
+consumer_key = os.getenv("CONSUMER_KEY")
+consumer_secret = os.getenv("CONSUMER_SECRET")
+access_token = os.getenv("ACCESS_TOKEN")
+access_token_secret = os.getenv("ACCESS_TOKEN_SECRET")
+
+# Authenticate to Twitter
+auth = tweepy.OAuth1UserHandler(consumer_key, consumer_secret, access_token, access_token_secret)
+api = tweepy.API(auth)
 class TwitterClient:
     def __init__(self, credentials):
         """
@@ -74,16 +88,14 @@ class TwitterClient:
         except Exception as e:
             logging.error(f"Error getting latest non-reply tweet: {e}")
             return None
-
-    def get_tweet(self, tweet_id, tweet_fields=None):
-        """
-        Retrieve a specific tweet by ID
-        
-        :param tweet_id: ID of the tweet to retrieve
-        :param tweet_fields: Fields to retrieve
-        :return: Tweet data
-        """
-        return self.client.get_tweet(tweet_id, tweet_fields=tweet_fields)
+    
+    def get_tweet(tweet_id):
+        try:
+            tweet = api.get_status(tweet_id, tweet_mode='extended')
+            return tweet
+        except tweepy.errors.TweepyException as e:
+            print(f"Error: {e}")
+            return None
 
     def create_tweet(self, text):
         """

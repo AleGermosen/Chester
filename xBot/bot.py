@@ -77,15 +77,24 @@ class TwitterTranslationBot:
                 logging.info(f"Checking for new tweets from {self.target_username}...")
                 
                 # Get user ID
-                user_id = self.twitter_client.get_user_id(self.target_username)
+                user_id = 956152568937316353 # Haitian Creole | @haitienespanol
+                # user_id = 1824451824495235078 # Direction de l’Immigration et de l’Émigration | @DIEHaiti
+                # user_id = self.twitter_client.get_user_id(self.target_username)
                 if not user_id:
                     logging.error(f"Could not find user ID for {self.target_username}")
                     time.sleep(self.check_interval)
                     continue
                 
                 # Get latest tweet
-                tweet = self.twitter_client.get_latest_non_reply_tweet(user_id)
-                
+                tweet_id = "1878418995981803859" # "1880641368122597437"
+                tweet = TwitterClient.get_tweet(tweet_id)
+                if tweet:
+                    print(tweet.full_text)
+                # tweet = self.twitter_client.get_tweet(1880641368122597437)
+                # tweet = self.twitter_client.get_latest_non_reply_tweet(user_id)
+                # tweet = 1880641368122597437 # @haitienespanol
+                # tweet = 1841881311704752369 # @DIEHaiti
+
                 if tweet and str(tweet.id) != str(last_processed_id):
                     logging.info(f"Found new tweet: {tweet.text}")
                     
