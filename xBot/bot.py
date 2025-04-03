@@ -6,143 +6,385 @@ import tweepy
 from config import Config
 from twitter_client import TwitterClient
 from translation_service import TranslationService
+from ocr_reader import extract_and_translate_text, save_to_documents, OCRReader
+import tempfile
+import requests
+from datetime import datetime
 
-class TwitterTranslationBot:
-    def __init__(self, target_username, check_interval=300):
-        """
-        Initialize Twitter Translation Bot
-        
-        :param target_username: Username to monitor
-        :param check_interval: Time between checks in seconds
-        """
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('twitter_bot.log'),
-                logging.StreamHandler()
-            ]
-        )
-        
-        # Load configuration
+class TwitterBot:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
         self.config = Config()
+        self.client = TwitterClient()
         
-        # Initialize services
-        twitter_credentials = self.config.get_twitter_credentials()
-        self.twitter_client = TwitterClient(twitter_credentials)
+        # Get detect API key first
+        detect_api_key = self.config.get_detect_api_key()
+        if detect_api_key:
+            detect_api_key = detect_api_key.strip()
+            if not detect_api_key:
+                self.logger.warning("Empty detect API key found in config")
+                detect_api_key = None
+            else:
+                self.logger.info(f"Found detect API key (length: {len(detect_api_key)})")
+        else:
+            self.logger.warning("No detect API key found in config")
+            detect_api_key = None
+            
+        # Create translation service with API key
+        self.translator = TranslationService(detect_api_key)
         
-        translation_api_key = self.config.get_translation_api_key()
-        self.translation_service = TranslationService(translation_api_key)
+        # Pass the translator to OCRReader
+        self.ocr = OCRReader(translator=self.translator)
         
-        # Bot configuration
-        self.target_username = target_username
-        self.check_interval = check_interval
-        self.last_processed_id_file = 'last_processed_id.txt'
-        
-    def _save_last_processed_id(self, tweet_id):
-        """
-        Save the last processed tweet ID to file
-        
-        :param tweet_id: ID of the last processed tweet
-        """
-        try:
-            with open(self.last_processed_id_file, 'w') as file:
-                file.write(str(tweet_id))
-        except IOError as e:
-            logging.error(f"Failed to save last processed ID: {e}")
+        self.last_processed_id = self._load_last_processed_id()
+        self.processed_mentions_file = "processed_mentions.txt"
+        self.downloaded_tweets_file = "downloaded_tweets.txt"
+        self.pending_tweets_file = "pending_tweets.txt"
+        self.processed_accounts_file = "processed_accounts.txt"  # New file for tracking accounts
+        self.processed_mentions = self.load_processed_mentions()
+        self.downloaded_tweets = self.load_downloaded_tweets()
+        self.pending_tweets = self.load_pending_tweets()
+        self.processed_accounts = self.load_processed_accounts()  # Load processed accounts
 
-    def _read_last_processed_id(self):
-        """
-        Read the last processed tweet ID from file
-        
-        :return: Last processed tweet ID or None
-        """
+    def _load_last_processed_id(self):
+        """Load the last processed tweet ID from file"""
         try:
-            if os.path.exists(self.last_processed_id_file):
-                with open(self.last_processed_id_file, 'r') as file:
-                    return file.read().strip()
-        except IOError as e:
-            logging.error(f"Failed to read last processed ID: {e}")
-        return None
+            with open('last_processed_id.txt', 'r') as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            return None
+
+    def _save_last_processed_id(self, tweet_id):
+        """Save the last processed tweet ID to file"""
+        with open('last_processed_id.txt', 'w') as f:
+            f.write(str(tweet_id))
+
+    def _extract_original_tweet_id(self, mention):
+        """Extract the original tweet ID from a mention"""
+        try:
+            # Get the referenced tweets from the mention
+            if hasattr(mention, 'referenced_tweets'):
+                for ref in mention.referenced_tweets:
+                    if ref.type == 'replied_to':
+                        return ref.id
+            return None
+        except Exception as e:
+            self.logger.error(f"Error extracting original tweet ID: {str(e)}")
+            return None
+
+    def _process_tweet(self, mention):
+        """Process a mention and translate the original tweet"""
+        try:
+            # Skip if we've already processed this mention
+            if self.last_processed_id and str(mention.id) <= self.last_processed_id:
+                return
+
+            # Get the original tweet ID
+            original_tweet_id = self._extract_original_tweet_id(mention)
+            if not original_tweet_id:
+                self.logger.warning(f"Could not find original tweet ID in mention {mention.id}")
+                return
+
+            # Get the original tweet
+            original_tweet = self.client.get_tweet(original_tweet_id)
+            if not original_tweet:
+                self.logger.warning(f"Could not get original tweet {original_tweet_id}")
+                return
+
+            # Get tweet text
+            text = original_tweet.text
+            
+            # Check if tweet has media
+            if hasattr(original_tweet, 'attachments') and original_tweet.attachments:
+                # Download and process image
+                image_url = self.client.get_media_url(original_tweet_id)
+                if image_url:
+                    text = self.ocr.extract_text(image_url)
+            
+            # Detect language and translate
+            detected_lang = self.translator.detect_language(text)
+            if detected_lang and detected_lang != 'en':
+                translated_text = self.translator.translate_text(text, detected_lang)
+                if translated_text:
+                    # Format the reply
+                    reply_text = f"({detected_lang} → en):\n\n{translated_text}"
+                    self.client.post_reply(original_tweet_id, reply_text)
+            else:
+                self.logger.info(f"No translation needed for tweet {original_tweet_id} (language: {detected_lang})")
+            
+            # Update last processed ID
+            self._save_last_processed_id(mention.id)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing mention {mention.id}: {str(e)}")
+
+    def load_processed_mentions(self):
+        """Load the list of already processed mention IDs"""
+        try:
+            if os.path.exists(self.processed_mentions_file):
+                with open(self.processed_mentions_file, 'r') as f:
+                    return set(line.strip() for line in f)
+            return set()
+        except Exception as e:
+            self.logger.error(f"Error loading processed mentions: {e}")
+            return set()
+
+    def save_processed_mention(self, mention_id):
+        """Save a processed mention ID to the file"""
+        try:
+            with open(self.processed_mentions_file, 'a') as f:
+                f.write(f"{mention_id}\n")
+            self.processed_mentions.add(mention_id)
+        except Exception as e:
+            self.logger.error(f"Error saving processed mention: {e}")
+
+    def load_downloaded_tweets(self):
+        """Load the list of downloaded tweet IDs"""
+        try:
+            if os.path.exists(self.downloaded_tweets_file):
+                with open(self.downloaded_tweets_file, 'r') as f:
+                    return set(line.strip() for line in f)
+            return set()
+        except Exception as e:
+            self.logger.error(f"Error loading downloaded tweets: {e}")
+            return set()
+
+    def save_downloaded_tweet(self, tweet_id):
+        """Save a downloaded tweet ID to the file"""
+        try:
+            with open(self.downloaded_tweets_file, 'a') as f:
+                f.write(f"{tweet_id}\n")
+            self.downloaded_tweets.add(tweet_id)
+        except Exception as e:
+            self.logger.error(f"Error saving downloaded tweet: {e}")
+
+    def load_pending_tweets(self):
+        """Load the list of tweets waiting for image download"""
+        try:
+            if os.path.exists(self.pending_tweets_file):
+                with open(self.pending_tweets_file, 'r') as f:
+                    return set(line.strip() for line in f)
+            return set()
+        except Exception as e:
+            self.logger.error(f"Error loading pending tweets: {e}")
+            return set()
+
+    def save_pending_tweet(self, tweet_id):
+        """Save a tweet ID that needs image download"""
+        try:
+            with open(self.pending_tweets_file, 'a') as f:
+                f.write(f"{tweet_id}\n")
+            self.pending_tweets.add(tweet_id)
+        except Exception as e:
+            self.logger.error(f"Error saving pending tweet: {e}")
+
+    def remove_pending_tweet(self, tweet_id):
+        """Remove a tweet from the pending list"""
+        try:
+            self.pending_tweets.remove(tweet_id)
+            with open(self.pending_tweets_file, 'w') as f:
+                for tweet in self.pending_tweets:
+                    f.write(f"{tweet}\n")
+        except Exception as e:
+            self.logger.error(f"Error removing pending tweet: {e}")
+
+    def load_processed_accounts(self):
+        """Load the list of account IDs we've already processed"""
+        try:
+            if os.path.exists(self.processed_accounts_file):
+                with open(self.processed_accounts_file, 'r') as f:
+                    return set(line.strip() for line in f)
+            return set()
+        except Exception as e:
+            self.logger.error(f"Error loading processed accounts: {e}")
+            return set()
+
+    def save_processed_account(self, account_id):
+        """Save an account ID to the processed accounts file"""
+        try:
+            with open(self.processed_accounts_file, 'a') as f:
+                f.write(f"{account_id}\n")
+            self.processed_accounts.add(account_id)
+            self.logger.info(f"Saved processed account ID: {account_id}")
+        except Exception as e:
+            self.logger.error(f"Error saving processed account: {e}")
+
+    def process_mention(self, mention):
+        """Process a single mention"""
+        try:
+            self.logger.info(f"Starting to process mention {mention.id}")
+            # Skip if we've already processed this mention
+            if mention.id in self.processed_mentions:
+                self.logger.info(f"Skipping already processed mention {mention.id}")
+                return
+
+            # Get the original tweet if this is a reply
+            original_tweet_id = None
+            if mention.referenced_tweets:
+                for ref in mention.referenced_tweets:
+                    if ref.type == 'replied_to':
+                        original_tweet_id = ref.id
+                        break
+
+            if original_tweet_id:
+                self.logger.info(f"Found original tweet ID: {original_tweet_id}")
+                # Skip if we've already processed this original tweet
+                if original_tweet_id in self.processed_mentions:
+                    self.logger.info(f"Skipping already processed original tweet {original_tweet_id}")
+                    return
+
+                # Get the original tweet
+                original_tweet = self.client.get_tweet(original_tweet_id)
+                if not original_tweet:
+                    self.logger.warning(f"Could not get original tweet {original_tweet_id}")
+                    return
+
+                # Get tweet text
+                text = original_tweet.text
+                
+                # Check if tweet has media
+                if hasattr(original_tweet, 'attachments') and original_tweet.attachments:
+                    # Check if we've already processed this account
+                    author_id = str(original_tweet.author_id)
+                    if author_id in self.processed_accounts:
+                        self.logger.info(f"Already processed account {author_id}, using cached media URL")
+                        # For processed accounts, we can use the cached media URL directly
+                        image_url = self.client.get_cached_media_url(original_tweet_id)
+                    else:
+                        # For new accounts, get the media URL normally
+                        image_url = self.client.get_media_url(original_tweet_id)
+                        # Save the account ID after processing
+                        self.save_processed_account(author_id)
+
+                    if image_url:
+                        try:
+                            # Extract text from image
+                            extracted_text = self.ocr.extract_text(image_url)
+                            if extracted_text:
+                                text = extracted_text
+                                self.logger.info(f"Successfully extracted text from image for tweet {original_tweet_id}")
+                                
+                                # Save the extracted text
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                extracted_text_filename = f"tweet_{original_tweet_id}_{timestamp}_extracted.txt"
+                                with open(os.path.join("extracted_texts", extracted_text_filename), 'w', encoding='utf-8') as f:
+                                    f.write(text)
+                                self.logger.info(f"Saved extracted text to {extracted_text_filename}")
+                            else:
+                                self.logger.warning(f"No text extracted from image for tweet {original_tweet_id}")
+                        except Exception as e:
+                            self.logger.error(f"Error processing image for tweet {original_tweet_id}: {str(e)}")
+                            # Continue with original text if image processing fails
+                
+                # Detect language and translate
+                detected_lang = self.translator.detect_language(text)
+                if detected_lang and detected_lang != 'en':
+                    translated_text = self.translator.translate_text(text, source_language=detected_lang)
+                    if translated_text:
+                        # Format the reply
+                        reply_text = f"({detected_lang} → en):\n\n{translated_text}"
+                        self.client.post_reply(original_tweet_id, reply_text)
+                        
+                        # Save the translated text
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        translated_text_filename = f"tweet_{original_tweet_id}_{timestamp}_translated.txt"
+                        with open(os.path.join("extracted_texts", translated_text_filename), 'w', encoding='utf-8') as f:
+                            f.write(translated_text)
+                        self.logger.info(f"Saved translated text to {translated_text_filename}")
+                else:
+                    self.logger.info(f"No translation needed for tweet {original_tweet_id} (language: {detected_lang})")
+                
+                # Save to processed mentions
+                self.save_processed_mention(original_tweet_id)
+                
+            # Save this mention to processed mentions
+            self.save_processed_mention(mention.id)
+            
+        except Exception as e:
+            self.logger.error(f"Error processing mention {mention.id}: {str(e)}")
+
+    def process_pending_tweets(self):
+        """Process tweets that are waiting for image download"""
+        self.logger.info(f"Starting to process {len(self.pending_tweets)} pending tweets")
+        for tweet_id in list(self.pending_tweets):  # Create a copy to iterate
+            try:
+                self.logger.info(f"Processing pending tweet {tweet_id}")
+                # Get the media URL
+                self.logger.info(f"Getting media URL for pending tweet {tweet_id}")
+                media_url = self.client.get_media_url(tweet_id)
+                if media_url:
+                    self.logger.info(f"Found media URL for pending tweet {tweet_id}")
+                    # Download the image
+                    self.logger.info(f"Downloading image for pending tweet {tweet_id}")
+                    image_path = self.ocr.download_image(media_url)
+                    if image_path:
+                        self.logger.info(f"Successfully downloaded image for tweet {tweet_id}")
+                        # Save as downloaded
+                        self.save_downloaded_tweet(tweet_id)
+                        # Remove from pending
+                        self.remove_pending_tweet(tweet_id)
+                        self.logger.info(f"Removed tweet {tweet_id} from pending list")
+                        
+                        # Process the image
+                        try:
+                            self.logger.info(f"Extracting text from downloaded image for tweet {tweet_id}")
+                            extracted_text = self.ocr.extract_text(image_path)
+                            if extracted_text:
+                                self.logger.info(f"Successfully extracted text from tweet {tweet_id}")
+                                detected_lang = self.translator.detect_language(extracted_text)
+                                if detected_lang and detected_lang != 'en':
+                                    self.logger.info(f"Detected non-English language ({detected_lang}) for tweet {tweet_id}")
+                                    translated_text = self.translator.translate_text(extracted_text)
+                                    if translated_text:
+                                        reply_text = f"Translation: {translated_text}"
+                                        self.client.post_reply(tweet_id, reply_text)
+                                        self.logger.info(f"Successfully processed pending tweet {tweet_id}")
+                                        self.save_processed_mention(tweet_id)
+                            else:
+                                self.logger.warning(f"No text extracted from downloaded image for tweet {tweet_id}")
+                        finally:
+                            self.logger.info(f"Cleaning up downloaded image for tweet {tweet_id}")
+                            self.ocr.cleanup_image(image_path)
+                else:
+                    self.logger.warning(f"No media URL found for pending tweet {tweet_id}")
+            except Exception as e:
+                if "Rate limit exceeded" in str(e):
+                    self.logger.warning(f"Rate limit hit while processing pending tweet {tweet_id}")
+                else:
+                    self.logger.error(f"Error processing pending tweet {tweet_id}: {e}")
 
     def run(self):
-        """
-        Main bot loop to check for new tweets, translate and repost
-        """
-        last_processed_id = self._read_last_processed_id()
+        """Main bot loop"""
+        self.logger.info("Starting Twitter bot...")
+        last_check_time = 0  # Initialize to 0 to check immediately
         
         while True:
             try:
-                logging.info(f"Checking for new tweets from {self.target_username}...")
+                current_time = time.time()
+                self.logger.info("Starting main loop iteration")
                 
-                # Get user ID
-                user_id = 956152568937316353 # Haitian Creole | @haitienespanol
-                # user_id = 1824451824495235078 # Direction de l’Immigration et de l’Émigration | @DIEHaiti
-                # user_id = self.twitter_client.get_user_id(self.target_username)
-                if not user_id:
-                    logging.error(f"Could not find user ID for {self.target_username}")
-                    time.sleep(self.check_interval)
-                    continue
-                
-                # Get latest tweet
-                tweet_id = "1878418995981803859" # "1880641368122597437"
-                tweet = TwitterClient.get_tweet(tweet_id)
-                if tweet:
-                    print(tweet.full_text)
-                # tweet = self.twitter_client.get_tweet(1880641368122597437)
-                # tweet = self.twitter_client.get_latest_non_reply_tweet(user_id)
-                # tweet = 1880641368122597437 # @haitienespanol
-                # tweet = 1841881311704752369 # @DIEHaiti
-
-                if tweet and str(tweet.id) != str(last_processed_id):
-                    logging.info(f"Found new tweet: {tweet.text}")
-                    
-                    try:
-                        # Detect language
-                        detected_language = self.translation_service.detect_language(tweet.text)
-                        if not detected_language:
-                            logging.error("Failed to detect language")
-                            time.sleep(self.check_interval)
-                            continue
-                        
-                        # Skip if already in English
-                        if detected_language == 'en':
-                            logging.info("Tweet is already in English, skipping translation")
-                            self._save_last_processed_id(tweet.id)
-                            last_processed_id = tweet.id
-                            time.sleep(self.check_interval)
-                            continue
-                        
-                        # Prepare translated tweet
-                        repost_text = self.translation_service.prepare_tweet(tweet.text, detected_language)
-                        if not repost_text:
-                            logging.error("Failed to prepare tweet for reposting")
-                            time.sleep(self.check_interval)
-                            continue
-                        
-                        # Create and post translation
-                        response_data = self.twitter_client.create_tweet(repost_text)
-                        if response_data:
-                            logging.info(f"Successfully posted tweet: {response_data['id']}")
-                            self._save_last_processed_id(tweet.id)
-                            last_processed_id = tweet.id
-                        else:
-                            logging.error("Failed to post tweet, will retry on next iteration")
-                            
-                    except Exception as e:
-                        logging.error(f"Error processing tweet: {str(e)}")
+                # Process any pending tweets first
+                if self.pending_tweets:
+                    self.logger.info(f"Processing {len(self.pending_tweets)} pending tweets")
+                    self.process_pending_tweets()
                 else:
-                    logging.info("No new tweets found")
+                    self.logger.info("No pending tweets to process")
                 
-                time.sleep(self.check_interval)
+                # Check for new mentions
+                self.logger.info("Checking for new mentions")
+                mentions = self.client.get_mentions(count=10)
                 
-            except tweepy.errors.TooManyRequests as e:
-                reset_time = int(e.response.headers.get('x-rate-limit-reset', 0))
-                wait_time = max(reset_time - int(time.time()), 60)  # At least 60 seconds
-                logging.warning(f"Rate limit exceeded. Waiting {wait_time} seconds...")
-                time.sleep(wait_time)
+                # Process each mention
+                for mention in mentions:
+                    self.process_mention(mention)
+                
+                # Update last check time
+                last_check_time = current_time
+                
+                # Wait before next check
+                self.logger.info("Waiting 60 seconds before next check")
+                time.sleep(60)
                 
             except Exception as e:
-                logging.error(f"Unexpected error in main loop: {str(e)}")
-                time.sleep(60)
+                self.logger.error(f"Error in main loop: {str(e)}")
+                time.sleep(60)  # Wait a minute before retrying

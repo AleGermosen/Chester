@@ -8,14 +8,63 @@ from translation_service import TranslationService
 import logging
 from langdetect import detect
 from dotenv import load_dotenv
+import requests
+import tempfile
 
-def extract_and_translate_text(image_path, languages=['en']):
+class OCRReader:
+    def __init__(self, translator=None):
+        self.logger = logging.getLogger(__name__)
+        self.reader = easyocr.Reader(['en', 'fr', 'es'])
+        self.translator = translator or TranslationService()
+        self.logger.info(f"OCRReader initialized with translator (API key present: {self.translator.detect_api_key is not None})")
+
+    def extract_text(self, image_url):
+        """Extract text from an image URL"""
+        try:
+            # Download image to temporary file
+            response = requests.get(image_url)
+            response.raise_for_status()
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+                temp_file.write(response.content)
+                temp_path = temp_file.name
+            
+            try:
+                # Extract text using EasyOCR
+                results = self.reader.readtext(temp_path)
+                
+                # Combine all text
+                text = " ".join([result[1] for result in results])
+                
+                # Detect language
+                detected_lang = self.translator.detect_language(text)
+                self.logger.info(f"Detected language: {detected_lang}")
+                
+                # Translate if needed
+                if detected_lang and detected_lang != 'en':
+                    text = self.translator.translate_text(text, source_language=detected_lang)
+                
+                return text
+                
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                    
+        except Exception as e:
+            self.logger.error(f"Error extracting text from image: {str(e)}")
+            return None
+
+def extract_and_translate_text(image_path, languages=['en'], translator=None):
     """
     Extract text from an image using EasyOCR and translate it
     
     Args:
         image_path (str): Path to the image file
         languages (list): List of language codes for OCR
+        translator (TranslationService, optional): Translator instance to use
     
     Returns:
         list: List of dictionaries containing original and translated text
@@ -23,37 +72,30 @@ def extract_and_translate_text(image_path, languages=['en']):
     try:
         # Initialize the readers
         reader = easyocr.Reader(languages)
-        translator = TranslationService()
-
-        # Load environment variables from .env file
-        load_dotenv()
-
-        # Get the API key from the environment variable
-        api_key = os.getenv("DETECT_API_KEY")
-
-        # Initialize the translator with the API key
-        translator = TranslationService(api_key)
+        
+        # Use provided translator or create new one
+        if translator is None:
+            # Only create a new translator if none provided
+            load_dotenv()
+            api_key = os.getenv("DETECT_API_KEY")
+            translator = TranslationService(api_key)
+            logging.info(f"Created new translator with API key (present: {api_key is not None})")
         
         # Detect and recognize text
         results = reader.readtext(image_path)
         
         # Detect language of the text
         text = " ".join([result[1] for result in results])
-        # detected_lang = detect(text)
         detected_lang = translator.detect_language(text)
-        print(f"Detected language: {detected_lang}")
+        logging.info(f"Detected language: {detected_lang}")
 
         # Format results with translation
         formatted_results = []
         for bbox, text, confidence in results:
-            # Detect language of extracted text
-            # detected_lang = 'fr' # translator.detect_language(text)
-            # detected_lang = detect(text)
-            
             # Only translate if language is detected and it's not English
             translated_text = None
             if detected_lang and detected_lang != 'en':
-                translated_text = translator.translate_text(text, detected_lang)
+                translated_text = translator.translate_text(text, source_language=detected_lang)
             
             formatted_results.append({
                 'original_text': text,
@@ -66,7 +108,7 @@ def extract_and_translate_text(image_path, languages=['en']):
         return formatted_results
     
     except Exception as e:
-        print(f"Error processing image: {str(e)}")
+        logging.error(f"Error processing image: {str(e)}")
         return []
 
 def save_to_documents(results, image_path, output_dir="extracted_texts"):

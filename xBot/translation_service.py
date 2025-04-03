@@ -10,8 +10,30 @@ class TranslationService:
         
         :param detect_api_key: API key for language detection
         """
+        self.logger = logging.getLogger(__name__)
         self.translator = GoogleTranslator(target='en')
-        self.detect_api_key = detect_api_key
+        
+        # Log initial API key state
+        self.logger.info(f"TranslationService initialization - API key provided: {detect_api_key is not None}")
+        if detect_api_key:
+            self.logger.info(f"Initial API key length: {len(detect_api_key)}")
+        
+        # Validate and store API key
+        if detect_api_key:
+            # Clean the API key
+            detect_api_key = detect_api_key.strip()
+            if not detect_api_key:
+                self.logger.warning("Empty API key provided after stripping")
+                self.detect_api_key = None
+            else:
+                self.detect_api_key = detect_api_key
+                self.logger.info(f"TranslationService initialized with valid API key (length: {len(detect_api_key)})")
+        else:
+            self.logger.warning("No API key provided for language detection")
+            self.detect_api_key = None
+            
+        # Log final API key state
+        self.logger.info(f"Final API key state - Present: {self.detect_api_key is not None}, Length: {len(self.detect_api_key) if self.detect_api_key else 0}")
 
     def detect_language(self, text):
         """
@@ -21,11 +43,36 @@ class TranslationService:
         :return: Detected language code
         """
         try:
+            # Log API key state at start of detection
+            self.logger.info(f"Starting language detection - API key present: {self.detect_api_key is not None}, Length: {len(self.detect_api_key) if self.detect_api_key else 0}")
+            
             # Clean the text before language detection
             cleaned_text = TweetProcessor.clean_tweet_text(text)
-            return single_detection(cleaned_text, api_key=self.detect_api_key)
+            
+            # Skip first 10 words to avoid common English words at the start
+            words = cleaned_text.split()
+            if len(words) > 10:
+                cleaned_text = ' '.join(words[10:])
+            
+            # Log API key details
+            self.logger.info(f"Attempting language detection with API key length: {len(self.detect_api_key) if self.detect_api_key else 0}")
+            self.logger.info(f"Text to detect: {cleaned_text[:100]}...")  # Log first 100 chars
+            
+            # Ensure API key is not empty or None
+            if not self.detect_api_key:
+                self.logger.error("No API key provided for language detection")
+                return None
+                
+            # Make the API call
+            detected_lang = single_detection(cleaned_text, api_key=self.detect_api_key)
+            self.logger.info(f"Successfully detected language: {detected_lang}")
+            return detected_lang
+            
         except Exception as e:
-            logging.error(f"Language detection error: {e}")
+            self.logger.error(f"Language detection error: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                self.logger.error(f"Response status code: {e.response.status_code}")
+                self.logger.error(f"Response text: {e.response.text}")
             return None
 
     def translate_text(self, text, source_language):

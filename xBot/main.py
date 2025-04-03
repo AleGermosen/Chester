@@ -1,30 +1,38 @@
 # main.py
+import os
 import logging
-from bot import TwitterTranslationBot
+from bot import TwitterBot
+from config import Config
+
+def setup_logging():
+    """Configure logging"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('twitter_bot.log'),
+            logging.StreamHandler()
+        ]
+    )
 
 def main():
+    """Main entry point"""
     try:
-        # List of potential usernames to translate
-        usernames = [
-            "haitienespanol",
-            "DominiqueAyiti",
-            "PresidenceHT",
-            "metropoleHT",
-            "RodneyHayti",
-            "DIEHaiti"
-        ]
+        # Setup logging
+        setup_logging()
+        logger = logging.getLogger(__name__)
         
-        # Choose a username (you can modify this logic as needed)
-        target_username = "haitienespanol"
+        # Initialize bot
+        logger.info("Initializing Twitter bot...")
+        bot = TwitterBot()
         
-        # Initialize and run the bot
-        bot = TwitterTranslationBot(target_username)
+        # Run the bot
+        logger.info("Starting Twitter bot...")
         bot.run()
-    
-    except KeyboardInterrupt:
-        logging.info("Bot stopped by user")
+        
     except Exception as e:
-        logging.error(f"Fatal error: {str(e)}")
+        logger.error(f"Error in main: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()
