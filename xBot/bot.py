@@ -7,6 +7,7 @@ from config import Config
 from twitter_client import TwitterClient
 from translation_service import TranslationService
 from ocr_reader import extract_and_translate_text, save_to_documents, OCRReader
+from upload_doc import ArchiveUploader
 import tempfile
 import requests
 from datetime import datetime
@@ -35,6 +36,17 @@ class TwitterBot:
         
         # Pass the translator to OCRReader
         self.ocr = OCRReader(translator=self.translator)
+        
+        # Initialize Archive.org uploader
+        s3_access_key, s3_secret_key = self.config.get_s3_credentials()
+        if s3_access_key and s3_secret_key:
+            self.logger.info("Archive.org integration enabled with valid credentials")
+            self.archive_uploader = ArchiveUploader(s3_access_key, s3_secret_key)
+            self.archive_enabled = True
+        else:
+            self.logger.warning("Archive.org integration disabled - missing credentials")
+            self.archive_uploader = None
+            self.archive_enabled = False
         
         self.last_processed_id = self._load_last_processed_id()
         self.processed_mentions_file = "processed_mentions.txt"
@@ -106,9 +118,8 @@ class TwitterBot:
             if detected_lang and detected_lang != 'en':
                 translated_text = self.translator.translate_text(text, detected_lang)
                 if translated_text:
-                    # Format the reply
-                    reply_text = f"({detected_lang} → en):\n\n{translated_text}"
-                    self.client.post_reply(original_tweet_id, reply_text)
+                    # Save translation to Archive.org
+                    self._upload_to_archive(text, translated_text, detected_lang, original_tweet_id)
             else:
                 self.logger.info(f"No translation needed for tweet {original_tweet_id} (language: {detected_lang})")
             
@@ -117,6 +128,45 @@ class TwitterBot:
             
         except Exception as e:
             self.logger.error(f"Error processing mention {mention.id}: {str(e)}")
+
+    def _upload_to_archive(self, original_text, translated_text, detected_lang, tweet_id):
+        """Upload translation to Archive.org"""
+        # Skip if Archive.org integration is disabled
+        if not self.archive_enabled or not self.archive_uploader:
+            self.logger.info(f"Skipping Archive.org upload for tweet {tweet_id} - integration disabled")
+            return False
+            
+        try:
+            # Create a filename with timestamp and tweet ID
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            filename = f"extracted_texts/tweet_{tweet_id}_{timestamp}.txt"
+            
+            # Upload to Archive.org
+            archive_url = self.archive_uploader.upload_translation(
+                file_path=filename,
+                language_from=detected_lang,
+                original_text=original_text,
+                translated_text=translated_text,
+                tweet_id=tweet_id
+            )
+            
+            if archive_url:
+                self.logger.info(f"Translation for tweet {tweet_id} archived at: {archive_url}")
+                
+                # Post only the archive link as a reply to the original tweet
+                reply_text = f"Translation ({detected_lang} → en) available at: {archive_url}"
+                
+                # Post the reply with just the archive link
+                self.client.post_reply(tweet_id, reply_text)
+                self.logger.info(f"Posted archive link as reply to tweet {tweet_id}")
+                return True
+            else:
+                self.logger.warning(f"Failed to archive translation for tweet {tweet_id}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error uploading to Archive.org: {str(e)}")
+            return False
 
     def load_processed_mentions(self):
         """Load the list of already processed mention IDs"""
@@ -281,16 +331,15 @@ class TwitterBot:
                 if detected_lang and detected_lang != 'en':
                     translated_text = self.translator.translate_text(text, source_language=detected_lang)
                     if translated_text:
-                        # Format the reply
-                        reply_text = f"({detected_lang} → en):\n\n{translated_text}"
-                        self.client.post_reply(original_tweet_id, reply_text)
-                        
-                        # Save the translated text
+                        # Save the translated text locally
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         translated_text_filename = f"tweet_{original_tweet_id}_{timestamp}_translated.txt"
                         with open(os.path.join("extracted_texts", translated_text_filename), 'w', encoding='utf-8') as f:
                             f.write(translated_text)
                         self.logger.info(f"Saved translated text to {translated_text_filename}")
+                        
+                        # Upload translation to Archive.org (this will post the archive link as a reply)
+                        self._upload_to_archive(text, translated_text, detected_lang, original_tweet_id)
                 else:
                     self.logger.info(f"No translation needed for tweet {original_tweet_id} (language: {detected_lang})")
                 
@@ -336,10 +385,11 @@ class TwitterBot:
                                     self.logger.info(f"Detected non-English language ({detected_lang}) for tweet {tweet_id}")
                                     translated_text = self.translator.translate_text(extracted_text)
                                     if translated_text:
-                                        reply_text = f"Translation: {translated_text}"
-                                        self.client.post_reply(tweet_id, reply_text)
-                                        self.logger.info(f"Successfully processed pending tweet {tweet_id}")
+                                        self.logger.info(f"Successfully translated text from tweet {tweet_id}")
                                         self.save_processed_mention(tweet_id)
+                                        
+                                        # Upload translation to Archive.org
+                                        self._upload_to_archive(extracted_text, translated_text, detected_lang, tweet_id)
                             else:
                                 self.logger.warning(f"No text extracted from downloaded image for tweet {tweet_id}")
                         finally:

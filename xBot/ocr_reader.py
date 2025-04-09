@@ -36,14 +36,11 @@ class OCRReader:
                 # Combine all text
                 text = " ".join([result[1] for result in results])
                 
-                # Detect language
+                # Detect language (but don't translate)
                 detected_lang = self.translator.detect_language(text)
                 self.logger.info(f"Detected language: {detected_lang}")
                 
-                # Translate if needed
-                if detected_lang and detected_lang != 'en':
-                    text = self.translator.translate_text(text, source_language=detected_lang)
-                
+                # Return the original text without translation
                 return text
                 
             finally:

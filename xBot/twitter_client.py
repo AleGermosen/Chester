@@ -135,8 +135,7 @@ class TwitterClient:
         try:
             response = self.client.create_tweet(
                 text=reply_text,
-                in_reply_to_tweet_id=tweet_id,
-                auto_populate_reply_metadata=True
+                in_reply_to_tweet_id=tweet_id
             )
             self.logger.info(f"Successfully posted reply to tweet {tweet_id}")
             return response

@@ -91,3 +91,19 @@ class Config:
         else:
             logging.warning("DETECT_API_KEY not found in environment variables")
             return None
+            
+    def get_s3_credentials(self):
+        """Retrieve S3/Archive.org credentials"""
+        access_key = os.getenv('S3_ACCESS_KEY')
+        secret_key = os.getenv('S3_SECRET_KEY')
+        
+        if not access_key or not secret_key:
+            logging.warning("Missing S3 credentials in environment variables")
+            return None, None
+            
+        access_key = self._clean_credential(access_key)
+        secret_key = self._clean_credential(secret_key)
+        
+        logging.info(f"Retrieved S3 credentials - Access key length: {len(access_key)}")
+        
+        return access_key, secret_key
