@@ -154,7 +154,7 @@ class TwitterBot:
                 self.logger.info(f"Translation for tweet {tweet_id} archived at: {archive_url}")
                 
                 # Post only the archive link as a reply to the original tweet
-                reply_text = f"Translation ({detected_lang} → en) available at: {archive_url}"
+                reply_text = f"Translation ({detected_lang} → en) available at: {archive_url}. No downloading required."
                 
                 # Post the reply with just the archive link
                 self.client.post_reply(tweet_id, reply_text)
@@ -168,25 +168,58 @@ class TwitterBot:
             self.logger.error(f"Error uploading to Archive.org: {str(e)}")
             return False
 
+    def save_processed_mention(self, mention_id):
+        """Save a processed mention ID to the file"""
+        try:
+            # First check if it's already in our in-memory set
+            if str(mention_id) in self.processed_mentions:
+                self.logger.info(f"Skipping already processed mention {mention_id}")
+                return
+
+            # Then check the file directly to be extra safe
+            if os.path.exists(self.processed_mentions_file):
+                with open(self.processed_mentions_file, 'r') as f:
+                    if str(mention_id) in [line.strip() for line in f]:
+                        self.logger.info(f"Found mention {mention_id} in file, skipping")
+                        return
+
+            # If we get here, it's a new mention
+            self.processed_mentions.add(str(mention_id))
+            
+            # Use a temporary file for atomic write
+            temp_file = f"{self.processed_mentions_file}.tmp"
+            with open(temp_file, 'w') as f:
+                # Write all existing mentions
+                if os.path.exists(self.processed_mentions_file):
+                    with open(self.processed_mentions_file, 'r') as old_f:
+                        for line in old_f:
+                            f.write(line)
+                # Write the new mention
+                f.write(f"{mention_id}\n")
+            
+            # Atomic rename
+            os.replace(temp_file, self.processed_mentions_file)
+            
+            # Reload processed mentions to ensure we have the latest data
+            self.processed_mentions = self.load_processed_mentions()
+            
+        except Exception as e:
+            self.logger.error(f"Error saving processed mention: {e}")
+            # Clean up temp file if it exists
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
     def load_processed_mentions(self):
         """Load the list of already processed mention IDs"""
         try:
             if os.path.exists(self.processed_mentions_file):
                 with open(self.processed_mentions_file, 'r') as f:
+                    # Use a set to ensure uniqueness
                     return set(line.strip() for line in f)
             return set()
         except Exception as e:
             self.logger.error(f"Error loading processed mentions: {e}")
             return set()
-
-    def save_processed_mention(self, mention_id):
-        """Save a processed mention ID to the file"""
-        try:
-            with open(self.processed_mentions_file, 'a') as f:
-                f.write(f"{mention_id}\n")
-            self.processed_mentions.add(mention_id)
-        except Exception as e:
-            self.logger.error(f"Error saving processed mention: {e}")
 
     def load_downloaded_tweets(self):
         """Load the list of downloaded tweet IDs"""
@@ -263,8 +296,9 @@ class TwitterBot:
         """Process a single mention"""
         try:
             self.logger.info(f"Starting to process mention {mention.id}")
+            
             # Skip if we've already processed this mention
-            if mention.id in self.processed_mentions:
+            if str(mention.id) in self.processed_mentions:
                 self.logger.info(f"Skipping already processed mention {mention.id}")
                 return
 
@@ -278,8 +312,9 @@ class TwitterBot:
 
             if original_tweet_id:
                 self.logger.info(f"Found original tweet ID: {original_tweet_id}")
+                
                 # Skip if we've already processed this original tweet
-                if original_tweet_id in self.processed_mentions:
+                if str(original_tweet_id) in self.processed_mentions:
                     self.logger.info(f"Skipping already processed original tweet {original_tweet_id}")
                     return
 
@@ -340,15 +375,16 @@ class TwitterBot:
                         
                         # Upload translation to Archive.org (this will post the archive link as a reply)
                         self._upload_to_archive(text, translated_text, detected_lang, original_tweet_id)
+                        
+                        # Save both the mention ID and original tweet ID to processed mentions
+                        self.save_processed_mention(mention.id)
+                        self.save_processed_mention(original_tweet_id)
                 else:
                     self.logger.info(f"No translation needed for tweet {original_tweet_id} (language: {detected_lang})")
+                    # Still save both IDs to prevent reprocessing
+                    self.save_processed_mention(mention.id)
+                    self.save_processed_mention(original_tweet_id)
                 
-                # Save to processed mentions
-                self.save_processed_mention(original_tweet_id)
-                
-            # Save this mention to processed mentions
-            self.save_processed_mention(mention.id)
-            
         except Exception as e:
             self.logger.error(f"Error processing mention {mention.id}: {str(e)}")
 
@@ -424,8 +460,18 @@ class TwitterBot:
                 self.logger.info("Checking for new mentions")
                 mentions = self.client.get_mentions(count=10)
                 
-                # Process each mention
+                # Filter out already processed mentions
+                new_mentions = []
                 for mention in mentions:
+                    if str(mention.id) not in self.processed_mentions:
+                        new_mentions.append(mention)
+                    else:
+                        self.logger.info(f"Skipping already processed mention {mention.id}")
+                
+                self.logger.info(f"Found {len(mentions)} mentions, {len(new_mentions)} are new")
+                
+                # Process each new mention
+                for mention in new_mentions:
                     self.process_mention(mention)
                 
                 # Update last check time
